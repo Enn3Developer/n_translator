@@ -1,9 +1,12 @@
 use clap::{Args, Parser, Subcommand};
 use epub::doc::EpubDoc;
+use html5ever::tendril::TendrilSink;
+use html5ever::tree_builder::TreeBuilderOpts;
+use html5ever::{parse_document, ParseOpts};
+use markup5ever_rcdom::{Handle, NodeData, RcDom};
 use ollama_rs::generation::completion::request::GenerationRequest;
 use ollama_rs::Ollama;
-use scraper::selectable::Selectable;
-use scraper::{Element, Html, Selector};
+use std::io::Cursor;
 
 #[derive(Parser)]
 #[clap(version, about, long_about = None)]
@@ -50,8 +53,27 @@ async fn translate(
                     "Translate the following text to {}:\n{}\n{}:",
                     language, text, language
                 ),
-            ).system(String::from("You are a professional translator. Don't answer with any notes. Answer only with the translation. Don't add the original. Follow the original style")))
+            ).system(String::from("You are a professional translator. Don't answer with any notes. Answer only with the translation. Don't add the original. Follow the original style. Don't translate links.")))
         .await.and_then(|res| Ok(res.response))
+}
+
+fn traverse(handle: &Handle, good: bool, string: &mut String) {
+    let mut is_good = false;
+    match &handle.data {
+        NodeData::Element { name, .. } => {
+            is_good = &name.local == "p";
+        }
+        NodeData::Text { contents } => {
+            let str = contents.borrow().to_string();
+            if good || str.contains("\n") {
+                string.push_str(&str);
+            }
+        }
+        _ => {}
+    }
+    for child in handle.children.borrow().iter() {
+        traverse(child, good || is_good, string);
+    }
 }
 
 #[tokio_macros::main(flavor = "multi_thread")]
@@ -66,33 +88,28 @@ async fn main() {
             Commands::Translate(args) => {
                 let ollama = Ollama::default();
                 if let Ok(mut epub) = EpubDoc::new(&args.file) {
-                    epub.set_current_page(20);
-                    let fragment = Html::parse_fragment(
-                        epub.get_current_str()
-                            .unwrap_or((String::new(), String::new()))
-                            .0
-                            .as_str(),
-                    );
-                    let selector = Selector::parse("p").unwrap();
-                    let span_selector = Selector::parse("span").unwrap();
-                    for element in fragment.select(&selector) {
-                        if element.inner_html().contains("br") {
-                            println!("line break found");
-                        }
-                        for span in element.select(&span_selector) {
-                            println!(
-                                "{}: {}",
-                                span.inner_html(),
-                                span.inner_html().contains("<span>"),
-                            );
-                        }
+                    let pages = epub.get_num_pages();
+                    let mut text = String::new();
+                    for page in 0..pages {
+                        epub.set_current_page(page);
+                        let mut current = epub.get_current().unwrap();
+                        let mut cursor = Cursor::new(&mut current.0);
+                        let dom = parse_document(
+                            RcDom::default(),
+                            ParseOpts {
+                                tree_builder: TreeBuilderOpts {
+                                    drop_doctype: true,
+                                    ..Default::default()
+                                },
+                                ..Default::default()
+                            },
+                        )
+                        .from_utf8()
+                        .read_from(&mut cursor)
+                        .unwrap();
+                        traverse(&dom.document, false, &mut text);
                     }
-                    // println!("{:?}", epub.get_current_str());
-                    // if let Ok(response) =
-                    //     translate(ollama, args.file, args.language, args.model).await
-                    // {
-                    //     println!("{}", response);
-                    // }
+                    println!("{text:?}");
                 }
             }
         }

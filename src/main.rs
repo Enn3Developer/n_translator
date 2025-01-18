@@ -49,8 +49,12 @@ struct TranslateArgs {
     /// Tags to check for content
     #[arg(short, long, default_value = "p", value_delimiter = ',')]
     tags: Vec<String>,
+    /// Tags to blacklist
     #[arg(short, long, default_value = "rt", value_delimiter = ',')]
     blacklist: Vec<String>,
+    /// How many post-translation passes to do
+    #[arg(long, default_value = "1")]
+    passes: usize,
 }
 
 async fn translate(
@@ -170,31 +174,36 @@ async fn main() {
                         )
                         .await;
                         if let Ok(Ok(translation)) = translation {
-                            let post = tokio::time::timeout(
-                                Duration::from_secs(20),
-                                post_translation(
-                                    &ollama,
-                                    part,
-                                    &translation,
-                                    &args.language,
-                                    args.model.clone(),
-                                ),
-                            )
-                            .await;
-                            if let Ok(Ok(post)) = post {
-                                file.write_all(format!("{post}\n").as_bytes())
-                                    .await
-                                    .expect("can't write to output file");
-                                println!(
-                                    "\n{idx}/{count}, {:2.2}%",
-                                    (idx as f32 / count as f32) * 100.0
-                                );
-                                println!("{part}");
-                                println!("{post}");
-                            } else {
-                                eprintln!("Error happened in post translation");
-                                return;
+                            let mut post = translation.clone();
+                            for _ in 0..args.passes {
+                                if let Ok(Ok(p)) = tokio::time::timeout(
+                                    Duration::from_secs(20),
+                                    post_translation(
+                                        &ollama,
+                                        part,
+                                        &post,
+                                        &args.language,
+                                        args.model.clone(),
+                                    ),
+                                )
+                                .await
+                                {
+                                    post = p;
+                                } else {
+                                    eprintln!("Error happened in post translation");
+                                    return;
+                                }
                             }
+
+                            file.write_all(format!("{post}\n").as_bytes())
+                                .await
+                                .expect("can't write to output file");
+                            println!(
+                                "\n{idx}/{count}, {:2.2}%",
+                                (idx as f32 / count as f32) * 100.0
+                            );
+                            println!("{part}");
+                            println!("{post}");
                         } else {
                             eprintln!("Error happened");
                             return;

@@ -5,6 +5,7 @@ use html5ever::tree_builder::TreeBuilderOpts;
 use html5ever::{parse_document, ParseOpts};
 use markup5ever_rcdom::{Handle, NodeData, RcDom};
 use ollama_rs::generation::completion::request::GenerationRequest;
+use ollama_rs::generation::options::GenerationOptions;
 use ollama_rs::Ollama;
 use std::io::Cursor;
 use std::time::Duration;
@@ -46,8 +47,10 @@ struct TranslateArgs {
     #[arg(short, long, default_value = "English")]
     language: String,
     /// Tags to check for content
-    #[arg(short, long, default_value = "p")]
+    #[arg(short, long, default_value = "p", value_delimiter = ',')]
     tags: Vec<String>,
+    #[arg(short, long, default_value = "rt", value_delimiter = ',')]
+    blacklist: Vec<String>,
 }
 
 async fn translate(
@@ -61,10 +64,10 @@ async fn translate(
             GenerationRequest::new(
                 model,
                 format!(
-                    "Translate the following text to {}:\n{}\n{}:",
-                    language, text, language
+                    "Translate the following text to {language}:\n{text}\n{language}:"
                 ),
-            ).system(String::from("You are a professional translator. Don't answer with any notes. Answer only with the translation. Don't add the original. Follow the original style. Don't translate links.")))
+            ).system(String::from("You are a professional translator. Don't answer with any notes. Answer only with the translation. Don't add the original. Follow the original style. Don't translate links.")
+            ).options(GenerationOptions::default().temperature(0.4)))
         .await.and_then(|res| Ok(res.response))
 }
 
@@ -77,15 +80,27 @@ async fn post_translation(
 ) -> ollama_rs::error::Result<String> {
     ollama
         .generate(GenerationRequest::new(model, format!("Given the original text, fix the {language} translated version.\nOriginal: {original}\nTranslated: {translated}"))
-        .system(String::from("You are a professional translator. Fix the issues with this translation. Write only the translated sentence with the fixes. If there aren't errors, copy the translated sentence. Don't write anything else"))).await.and_then(|res| Ok(res.response))
+        .system(String::from("You are a professional translator. Fix the issues with this translation. Write only the translated sentence with the fixes. If there aren't errors, copy the translated sentence. Don't write anything else. Follow the original style.")).options(GenerationOptions::default().temperature(0.1))).await.and_then(|res| Ok(res.response))
 }
 
-fn traverse(handle: &Handle, good: bool, string: &mut String, tags: &[String]) {
+fn traverse(
+    handle: &Handle,
+    good: bool,
+    string: &mut String,
+    tags: &[String],
+    blacklist: &[String],
+) {
     let mut is_good = false;
+    let mut blacklisted = false;
     match &handle.data {
         NodeData::Element { name, .. } => {
             for tag in tags {
                 is_good |= &name.local == tag;
+            }
+            for tag in blacklist {
+                if &name.local == tag {
+                    blacklisted = true;
+                }
             }
         }
         NodeData::Text { contents } => {
@@ -97,11 +112,17 @@ fn traverse(handle: &Handle, good: bool, string: &mut String, tags: &[String]) {
         _ => {}
     }
     for child in handle.children.borrow().iter() {
-        traverse(child, good || is_good, string, tags);
+        traverse(
+            child,
+            (good || is_good) && !blacklisted,
+            string,
+            tags,
+            blacklist,
+        );
     }
 }
 
-#[tokio_macros::main(flavor = "multi_thread")]
+#[tokio_macros::main(flavor = "current_thread")]
 async fn main() {
     let cli = Cli::parse();
     if let Some(command) = cli.command {
@@ -132,7 +153,7 @@ async fn main() {
                         .from_utf8()
                         .read_from(&mut cursor)
                         .unwrap();
-                        traverse(&dom.document, false, &mut text, &args.tags);
+                        traverse(&dom.document, false, &mut text, &args.tags, &args.blacklist);
                     }
                     let parts = text.split("\n");
                     let mut file = tokio::fs::File::create(args.output)
@@ -168,6 +189,7 @@ async fn main() {
                                     "\n{idx}/{count}, {:2.2}%",
                                     (idx as f32 / count as f32) * 100.0
                                 );
+                                println!("{part}");
                                 println!("{post}");
                             } else {
                                 eprintln!("Error happened in post translation");

@@ -7,10 +7,18 @@ use markup5ever_rcdom::{Handle, NodeData, RcDom};
 use ollama_rs::generation::completion::request::GenerationRequest;
 use ollama_rs::Ollama;
 use std::io::Cursor;
+use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 
 #[derive(Parser)]
 #[clap(version, about, long_about = None)]
 struct Cli {
+    /// URL that points to Ollama
+    #[arg(short, long, default_value = "http://localhost")]
+    url: String,
+    /// Port of Ollama instance
+    #[arg(short, long, default_value = "11434")]
+    port: u16,
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -37,12 +45,15 @@ struct TranslateArgs {
     /// Language to translate to
     #[arg(short, long, default_value = "English")]
     language: String,
+    /// Tags to check for content
+    #[arg(short, long, default_value = "p")]
+    tags: Vec<String>,
 }
 
 async fn translate(
-    ollama: Ollama,
-    text: String,
-    language: String,
+    ollama: &Ollama,
+    text: &str,
+    language: &str,
     model: String,
 ) -> ollama_rs::error::Result<String> {
     ollama
@@ -57,11 +68,25 @@ async fn translate(
         .await.and_then(|res| Ok(res.response))
 }
 
-fn traverse(handle: &Handle, good: bool, string: &mut String) {
+async fn post_translation(
+    ollama: &Ollama,
+    original: &str,
+    translated: &str,
+    language: &str,
+    model: String,
+) -> ollama_rs::error::Result<String> {
+    ollama
+        .generate(GenerationRequest::new(model, format!("Given the original text, fix the {language} translated version.\nOriginal: {original}\nTranslated: {translated}"))
+        .system(String::from("You are a professional translator. Fix the issues with this translation. Write only the translated sentence with the fixes. If there aren't errors, copy the translated sentence. Don't write anything else"))).await.and_then(|res| Ok(res.response))
+}
+
+fn traverse(handle: &Handle, good: bool, string: &mut String, tags: &[String]) {
     let mut is_good = false;
     match &handle.data {
         NodeData::Element { name, .. } => {
-            is_good = &name.local == "p";
+            for tag in tags {
+                is_good |= &name.local == tag;
+            }
         }
         NodeData::Text { contents } => {
             let str = contents.borrow().to_string();
@@ -72,7 +97,7 @@ fn traverse(handle: &Handle, good: bool, string: &mut String) {
         _ => {}
     }
     for child in handle.children.borrow().iter() {
-        traverse(child, good || is_good, string);
+        traverse(child, good || is_good, string, tags);
     }
 }
 
@@ -82,11 +107,11 @@ async fn main() {
     if let Some(command) = cli.command {
         match command {
             Commands::List => {
-                let ollama = Ollama::default();
+                let ollama = Ollama::new(cli.url, cli.port);
                 println!("{:?}", ollama.list_local_models().await.unwrap_or(vec![]));
             }
             Commands::Translate(args) => {
-                let ollama = Ollama::default();
+                let ollama = Ollama::new(cli.url, cli.port);
                 if let Ok(mut epub) = EpubDoc::new(&args.file) {
                     let pages = epub.get_num_pages();
                     let mut text = String::new();
@@ -107,9 +132,52 @@ async fn main() {
                         .from_utf8()
                         .read_from(&mut cursor)
                         .unwrap();
-                        traverse(&dom.document, false, &mut text);
+                        traverse(&dom.document, false, &mut text, &args.tags);
                     }
-                    println!("{text:?}");
+                    let parts = text.split("\n");
+                    let mut file = tokio::fs::File::create(args.output)
+                        .await
+                        .expect("can't create output file");
+                    let count = parts.clone().count();
+                    for (idx, part) in parts.enumerate() {
+                        if part.trim().len() < 1 {
+                            continue;
+                        }
+                        let translation = tokio::time::timeout(
+                            Duration::from_secs(20),
+                            translate(&ollama, part, &args.language, args.model.clone()),
+                        )
+                        .await;
+                        if let Ok(Ok(translation)) = translation {
+                            let post = tokio::time::timeout(
+                                Duration::from_secs(20),
+                                post_translation(
+                                    &ollama,
+                                    part,
+                                    &translation,
+                                    &args.language,
+                                    args.model.clone(),
+                                ),
+                            )
+                            .await;
+                            if let Ok(Ok(post)) = post {
+                                file.write_all(format!("{post}\n").as_bytes())
+                                    .await
+                                    .expect("can't write to output file");
+                                println!(
+                                    "\n{idx}/{count}, {:2.2}%",
+                                    (idx as f32 / count as f32) * 100.0
+                                );
+                                println!("{post}");
+                            } else {
+                                eprintln!("Error happened in post translation");
+                                return;
+                            }
+                        } else {
+                            eprintln!("Error happened");
+                            return;
+                        }
+                    }
                 }
             }
         }
